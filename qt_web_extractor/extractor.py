@@ -191,6 +191,9 @@ class _WebPage(QWebEnginePage):
         if not shadow_html or not shadow_html.strip():
             self.toHtml(self._on_html_ready)
             return
+        # Anubis challenge page self-redirects after PoW; skip and wait.
+        if not self._result.error and ('id="anubis_challenge"' in shadow_html or self.title() == "Making sure you're not a bot!"):
+            return
         self._on_html_ready(shadow_html)
 
     def _on_html_ready(self, html: str):
