@@ -1,0 +1,14 @@
+# Lines beginning with # are comments.
+# split_after keeps only the text after the last occurrence of the marker.
+# remove deletes all occurrences of the marker.
+# regex_remove deletes all regex matches.
+# fence removes a full-response Markdown/code fence wrapper when present.
+
+split_after=<channel|>
+remove=<|channel>thought
+remove=<|channel>analysis
+remove=<|channel>final
+remove=<turn|>
+regex_remove=<\|channel\>[^\n]*\n?
+fence=```markdown
+fence=```

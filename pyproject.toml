@@ -21,3 +21,6 @@ qt-web-extractor = "qt_web_extractor.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["qt_web_extractor*"]
+
+[tool.setuptools.package-data]
+qt_web_extractor = ["llm_cleanup.txt"]

@@ -217,9 +217,13 @@ The built-in MCP endpoint (`/mcp`) reuses the same running server process.
 No extra wrapper process is required.
 MCP uses the same Bearer authentication as `/extract`.
 
-Available MCP tool:
+Available MCP tools:
 - `fetch_url` with input `{ "url": "https://..." }`
-- Returns rendered Markdown text (with PDF auto-detection)
+- Returns full rendered Markdown text (with PDF auto-detection)
+- `summary_url` with input `{ "url": "https://...", "prompt": "optional focus" }`
+- Registered only when `LLM_BASE_URL` and `LLM_MODEL` are configured. It extracts
+  the page first, then summarizes the Markdown through the configured
+  OpenAI-compatible LLM endpoint.
 
 Claude Code example:
 
@@ -314,6 +318,14 @@ sudo systemctl enable --now qt-web-extractor
 | `HTTP_PROXY` | unset | HTTP outbound proxy |
 | `ALL_PROXY` | unset | Fallback outbound proxy |
 | `NO_PROXY` | unset | Hosts that bypass proxy |
+| `LLM_BASE_URL` | unset | OpenAI-compatible base URL used by `summary_url` |
+| `LLM_API_KEY` | unset | Optional Bearer token for the LLM endpoint |
+| `LLM_MODEL` | unset | Model name sent to the LLM endpoint |
+| `LLM_TIMEOUT` | `60` | LLM request timeout (seconds) |
+| `LLM_TEMPERATURE` | `0` | LLM sampling temperature |
+| `LLM_OUTPUT_CLEANUP_RULES` | bundled rules | Optional cleanup rules file for provider-specific response artifacts |
+| `LLM_SUMMARY_MAX_CHARS` | `16384` | Maximum extracted Markdown characters sent to the LLM |
+| `LLM_SUMMARY_MAX_TOKENS` | `2048` | Maximum summary tokens requested from the LLM |
 
 ## How it works
 
@@ -340,6 +352,8 @@ qt-web-extractor/
     ├── __init__.py
     ├── __main__.py      # CLI (extract + serve subcommands)
     ├── extractor.py     # core engine (QWebEnginePage)
+    ├── summarier.py     # optional LLM summary helper
+    ├── llm_cleanup.txt  # optional LLM response cleanup rules
     ├── server.py        # HTTP server wrapper
     └── tool.py          # Open WebUI tool interface
 ```

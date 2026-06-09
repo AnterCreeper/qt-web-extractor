@@ -23,6 +23,7 @@ import logging
 import queue
 import signal
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 try:
@@ -34,6 +35,7 @@ except Exception:
 from PySide6.QtCore import QTimer
 
 from qt_web_extractor.extractor import QtWebExtractor, _ExtractionResult
+from qt_web_extractor.summarier import summarize_markdown, summary_configured
 
 log = logging.getLogger("qt-web-extractor")
 
@@ -115,19 +117,104 @@ class _Handler(BaseHTTPRequestHandler):
         return extractor.detect_pdf_url(url)
 
     def _extract_one(self, url: str, pdf: bool = False) -> _ExtractionResult | None:
+        start = time.monotonic()
         req = _ExtractRequest(url, pdf=pdf)
         self.extract_queue.put(req)
         if not req.done.wait(timeout=self.timeout_s):
+            log.warning(
+                "Extract timed out: url=%s pdf=%s duration_ms=%d",
+                url,
+                pdf,
+                int((time.monotonic() - start) * 1000),
+            )
             return None
+        duration_ms = int((time.monotonic() - start) * 1000)
+        error = req.result.error if req.result is not None else "no result"
+        log.info(
+            "Extract finished: url=%s pdf=%s duration_ms=%d text_chars=%d error=%s",
+            url,
+            pdf,
+            duration_ms,
+            len(req.result.text or "") if req.result is not None else 0,
+            error or "",
+        )
         return req.result
 
     @staticmethod
+    def _mcp_error_result(url: str, error: str, *, title: str = "", markdown: str = "", extra: dict | None = None) -> dict:
+        response = {
+            "url": url,
+            "title": title,
+            "markdown": markdown,
+            "error": error,
+        }
+        if extra:
+            response.update(extra)
+        return {
+            "content": [{"type": "text", "text": f"Error: {error}"}],
+            "structuredContent": response,
+            "isError": True,
+        }
+
+    @staticmethod
+    def _mcp_success_result(markdown: str, response: dict, error: str = "") -> dict:
+        text = markdown
+        if error:
+            text = f"{markdown}\n\n[warning] {error}" if markdown else f"[warning] {error}"
+        return {
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": response,
+            "isError": False,
+        }
+
+    @staticmethod
+    def _build_tool_response(name: str, result: _ExtractionResult, url: str, prompt: str) -> tuple[dict, str, str]:
+        output_url = result.url or url
+        if name == "summary_url":
+            summary_start = time.monotonic()
+            summary = summarize_markdown(
+                result.text or "",
+                url=output_url,
+                title=result.title,
+                prompt=prompt,
+            )
+            log.info(
+                "MCP summary_url summary finished: url=%s duration_ms=%d applied=%s truncated=%s output_chars=%d error=%s",
+                output_url,
+                int((time.monotonic() - summary_start) * 1000),
+                summary.cleaned,
+                summary.truncated,
+                len(summary.markdown or ""),
+                summary.error or "",
+            )
+            response = {
+                "url": output_url,
+                "title": result.title,
+                "markdown": summary.markdown,
+                "error": result.error,
+                "summary": True,
+                "llm_summary_applied": summary.cleaned,
+                "llm_summary_truncated": summary.truncated,
+                **({"llm_summary_error": summary.error} if summary.error else {}),
+            }
+            return response, summary.markdown, result.error or ""
+
+        markdown = result.text or ""
+        response = {
+            "url": output_url,
+            "title": result.title,
+            "markdown": markdown,
+            "error": result.error,
+        }
+        return response, markdown, result.error or ""
+
+    @staticmethod
     def _mcp_tools() -> list[dict]:
-        return [
+        tools = [
             {
                 "name": "fetch_url",
                 "description": (
-                    "Extracts content from websites, including dynamic pages, to clean Markdown."
+                    "Extracts full content from websites, including dynamic pages, to clean Markdown."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -143,12 +230,42 @@ class _Handler(BaseHTTPRequestHandler):
                 "_meta": {
                     "anthropic/maxResultSizeChars": _MCP_MAX_RESULT_CHARS,
                 },
-            }
+            },
         ]
+        if summary_configured():
+            tools.append({
+                "name": "summary_url",
+                "description": (
+                    "Extracts a web page and returns a concise Markdown summary. "
+                    "Use the optional prompt to focus on specific information."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to extract and summarize.",
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Optional information need to focus the summary.",
+                        },
+                    },
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+                "_meta": {
+                    "anthropic/maxResultSizeChars": _MCP_MAX_RESULT_CHARS,
+                },
+            })
+        return tools
 
-    def _mcp_call_fetch_url(self, params: dict) -> dict:
+    def _mcp_call_tool(self, params: dict) -> dict:
+        tool_start = time.monotonic()
         name = params.get("name")
-        if name != "fetch_url":
+        if name == "summary_url" and not summary_configured():
+            raise ValueError("summary_url is unavailable because LLM_BASE_URL or LLM_MODEL is not configured")
+        if name not in {"fetch_url", "summary_url"}:
             raise ValueError("unknown tool name")
 
         arguments = params.get("arguments", {})
@@ -163,47 +280,54 @@ class _Handler(BaseHTTPRequestHandler):
         if not url:
             raise ValueError("arguments.url is required")
 
+        prompt = arguments.get("prompt", "")
+        if prompt is None:
+            prompt = ""
+        if not isinstance(prompt, str):
+            raise ValueError("arguments.prompt must be a string")
+        prompt = prompt.strip()
+
         pdf = self._is_pdf(url, self.extractor)
-        log.info("MCP fetch_url: %s (pdf=%s)", url, pdf)
+        log.info("MCP %s: %s (pdf=%s)", name, url, pdf)
         result = self._extract_one(url, pdf=pdf)
 
         if result is None:
             timeout_error = "extraction timed out"
-            return {
-                "content": [{"type": "text", "text": f"Error: {timeout_error}"}],
-                "structuredContent": {
-                    "url": url,
-                    "title": "",
-                    "markdown": "",
-                    "error": timeout_error,
-                },
-                "isError": True,
-            }
+            log.warning(
+                "MCP %s failed: url=%s duration_ms=%d error=%s",
+                name,
+                url,
+                int((time.monotonic() - tool_start) * 1000),
+                timeout_error,
+            )
+            return self._mcp_error_result(url, timeout_error)
 
-        markdown = result.text or ""
-        response = {
-            "url": result.url or url,
-            "title": result.title,
-            "markdown": markdown,
-            "error": result.error,
-        }
+        response, markdown, error = self._build_tool_response(name, result, url, prompt)
+        if error and not markdown:
+            log.warning(
+                "MCP %s failed: url=%s duration_ms=%d error=%s",
+                name,
+                url,
+                int((time.monotonic() - tool_start) * 1000),
+                error,
+            )
+            return self._mcp_error_result(
+                response["url"],
+                error,
+                title=response.get("title", ""),
+                markdown=response.get("markdown", ""),
+                extra={k: v for k, v in response.items() if k not in {"url", "title", "markdown", "error"}},
+            )
 
-        if result.error and not markdown:
-            return {
-                "content": [{"type": "text", "text": f"Error: {result.error}"}],
-                "structuredContent": response,
-                "isError": True,
-            }
-
-        text = markdown
-        if result.error:
-            text = f"{markdown}\n\n[warning] {result.error}" if markdown else f"[warning] {result.error}"
-
-        return {
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": response,
-            "isError": False,
-        }
+        log.info(
+            "MCP %s finished: url=%s duration_ms=%d output_chars=%d error=%s",
+            name,
+            url,
+            int((time.monotonic() - tool_start) * 1000),
+            len(markdown or ""),
+            error,
+        )
+        return self._mcp_success_result(markdown, response, error)
 
     def _handle_mcp(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -270,7 +394,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if method == "tools/call":
             try:
-                result = self._mcp_call_fetch_url(params)
+                result = self._mcp_call_tool(params)
             except ValueError as e:
                 self._send_mcp_error(request_id, -32602, "Invalid params", {"reason": str(e)})
                 return

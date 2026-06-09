@@ -15,6 +15,16 @@ TIMEOUT_MS=30000
 # API key for Bearer token auth (empty = no auth)
 #API_KEY=
 
+# Optional OpenAI-compatible endpoint used by summary_url.
+#LLM_BASE_URL=http://127.0.0.1:8000/v1
+#LLM_API_KEY=
+#LLM_MODEL=
+#LLM_TIMEOUT=60
+#LLM_TEMPERATURE=0
+#LLM_OUTPUT_CLEANUP_RULES=/path/to/llm_cleanup.txt
+#LLM_SUMMARY_MAX_CHARS=16384
+#LLM_SUMMARY_MAX_TOKENS=2048
+
 # Standard outbound proxy environment variables.
 # Applies to both Chromium (Qt WebEngine) and HTTP fallback requests.
 # Only HTTP/HTTPS forward proxies are supported end-to-end.
