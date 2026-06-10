@@ -20,8 +20,11 @@
 
 import json
 import logging
+import os
 import queue
+import select
 import signal
+import socket
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -141,6 +144,20 @@ class _Handler(BaseHTTPRequestHandler):
         return req.result
 
     @staticmethod
+    def _client_connected(sock) -> bool:
+        try:
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error != 0:
+                return False
+            try:
+                data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                return len(data) > 0
+            except BlockingIOError:
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
     def _mcp_error_result(url: str, error: str, *, title: str = "", markdown: str = "", extra: dict | None = None) -> dict:
         response = {
             "url": url,
@@ -167,37 +184,92 @@ class _Handler(BaseHTTPRequestHandler):
             "isError": False,
         }
 
-    @staticmethod
-    def _build_tool_response(name: str, result: _ExtractionResult, url: str, prompt: str) -> tuple[dict, str, str]:
+    def _build_tool_response(self, name: str, result: _ExtractionResult, url: str, prompt: str) -> tuple[dict, str, str]:
         output_url = result.url or url
         if name == "summary_url":
-            summary_start = time.monotonic()
-            summary = summarize_markdown(
-                result.text or "",
-                url=output_url,
-                title=result.title,
-                prompt=prompt,
-            )
-            log.info(
-                "MCP summary_url summary finished: url=%s duration_ms=%d applied=%s truncated=%s output_chars=%d error=%s",
-                output_url,
-                int((time.monotonic() - summary_start) * 1000),
-                summary.cleaned,
-                summary.truncated,
-                len(summary.markdown or ""),
-                summary.error or "",
-            )
-            response = {
+            cancel = threading.Event()
+            if not self._client_connected(self.connection):
+                return (
+                    {"url": output_url, "title": result.title, "markdown": "", "error": "client disconnected before LLM call",
+                     "summary": True, "llm_summary_applied": False, "llm_summary_truncated": False},
+                    "",
+                    "client disconnected before LLM call",
+                )
+
+            result_holder = []
+            exception_holder = []
+
+            pipe_r, pipe_w = os.pipe()
+
+            def _run_llm():
+                try:
+                    summary = summarize_markdown(
+                        result.text or "",
+                        url=output_url,
+                        title=result.title,
+                        prompt=prompt,
+                        cancel=cancel,
+                    )
+                    response = {
+                        "url": output_url,
+                        "title": result.title,
+                        "markdown": summary.markdown,
+                        "error": result.error,
+                        "summary": True,
+                        "llm_summary_applied": summary.cleaned,
+                        "llm_summary_truncated": summary.truncated,
+                        **({"llm_summary_error": summary.error} if summary.error else {}),
+                    }
+                    result_holder.append((response, summary.markdown, result.error or ""))
+                except Exception as e:
+                    exception_holder.append(e)
+                finally:
+                    try:
+                        os.write(pipe_w, b"\x00")
+                    except OSError:
+                        pass
+
+            llm_thread = threading.Thread(target=_run_llm, daemon=True)
+            llm_thread.start()
+
+            try:
+                while llm_thread.is_alive():
+                    r, _, _ = select.select([self.connection, pipe_r], [], [])
+                    if pipe_r in r:
+                        break
+                    cancel.set()
+                    llm_thread.join(timeout=5)
+                    break
+            finally:
+                os.close(pipe_r)
+                os.close(pipe_w)
+
+            if exception_holder:
+                raise exception_holder[0]
+
+            if result_holder:
+                summary_response, summary_markdown, summary_error = result_holder[0]
+                log.info(
+                    "MCP summary_url summary finished: url=%s applied=%s truncated=%s output_chars=%d error=%s",
+                    output_url,
+                    summary_response.get("llm_summary_applied"),
+                    summary_response.get("llm_summary_truncated"),
+                    len(summary_markdown or ""),
+                    summary_error,
+                )
+                return summary_response, summary_markdown, summary_error
+
+            cancel_error = "request cancelled by client timeout"
+            cancel_response = {
                 "url": output_url,
                 "title": result.title,
-                "markdown": summary.markdown,
-                "error": result.error,
+                "markdown": "",
+                "error": cancel_error,
                 "summary": True,
-                "llm_summary_applied": summary.cleaned,
-                "llm_summary_truncated": summary.truncated,
-                **({"llm_summary_error": summary.error} if summary.error else {}),
+                "llm_summary_applied": False,
+                "llm_summary_truncated": False,
             }
-            return response, summary.markdown, result.error or ""
+            return cancel_response, "", cancel_error
 
         markdown = result.text or ""
         response = {
@@ -303,6 +375,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._mcp_error_result(url, timeout_error)
 
         response, markdown, error = self._build_tool_response(name, result, url, prompt)
+
         if error and not markdown:
             log.warning(
                 "MCP %s failed: url=%s duration_ms=%d error=%s",

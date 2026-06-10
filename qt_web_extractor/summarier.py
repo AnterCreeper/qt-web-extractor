@@ -18,13 +18,15 @@
 # You should have received a copy of the GNU General Public License
 # along with Qt Web Extractor. If not, see <https://www.gnu.org/licenses/>.
 
+import http.client
 import json
 import logging
 import os
 import re
+import socket
+import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,11 +117,15 @@ def _call_chat_completion(
     user_prompt: str,
     max_tokens_env: str,
     default_max_tokens: int,
+    cancel: threading.Event | None = None,
 ) -> tuple[str, str]:
     base_url = _env_first("LLM_BASE_URL")
     model = _env_first("LLM_MODEL")
     if not base_url or not model:
         return "", "LLM_BASE_URL or LLM_MODEL is not configured"
+
+    if cancel is not None and cancel.is_set():
+        return "", "Cancelled"
 
     request_payload = {
         "model": model,
@@ -135,32 +141,71 @@ def _call_chat_completion(
         request_payload["max_tokens"] = max_tokens
 
     body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        _build_chat_completions_url(base_url),
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
 
+    headers = {"Content-Type": "application/json"}
     api_key = _env_first("LLM_API_KEY")
     if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
+        headers["Authorization"] = f"Bearer {api_key}"
 
-    timeout = _env_int_first("LLM_TIMEOUT", default=_DEFAULT_LLM_TIMEOUT)
+    http_timeout = _env_int_first("LLM_TIMEOUT", default=_DEFAULT_LLM_TIMEOUT)
+    url = _build_chat_completions_url(base_url)
+    parsed = urllib.parse.urlsplit(url)
+    use_ssl = parsed.scheme == "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if use_ssl else 80)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+
+    if use_ssl:
+        conn = http.client.HTTPSConnection(host, port, timeout=http_timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=http_timeout)
+
+    sock_box: list[socket.socket | None] = [None]
+
+    if cancel is not None:
+        def _cancel_monitor():
+            cancel.wait()
+            sock = sock_box[0]
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        monitor = threading.Thread(target=_cancel_monitor, daemon=True)
+        monitor.start()
+
     start = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            response_payload = json.loads(resp.read().decode(charset, errors="replace"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
+        conn.request("POST", path, body=body, headers=headers)
+        sock_box[0] = conn.sock
+        resp = conn.getresponse()
+
+        if resp.status >= 400:
+            detail = resp.read().decode("utf-8", errors="replace")[:500]
+            log.warning(
+                "LLM chat completion HTTP error: duration_ms=%d status=%d detail=%s",
+                int((time.monotonic() - start) * 1000),
+                resp.status,
+                detail,
+            )
+            return "", f"LLM HTTP {resp.status}: {detail}"
+
+        charset = resp.headers.get_content_charset() or "utf-8"
+        response_payload = json.loads(resp.read().decode(charset, errors="replace"))
+    except OSError as e:
+        if cancel is not None and cancel.is_set():
+            log.info(
+                "LLM chat completion cancelled: duration_ms=%d",
+                int((time.monotonic() - start) * 1000),
+            )
+            return "", "Cancelled"
         log.warning(
-            "LLM chat completion HTTP error: duration_ms=%d status=%s detail=%s",
+            "LLM chat completion failed: duration_ms=%d error=%s",
             int((time.monotonic() - start) * 1000),
-            e.code,
-            detail,
+            e,
         )
-        return "", f"LLM HTTP {e.code}: {detail}"
+        return "", f"LLM failed: {e}"
     except Exception as e:
         log.warning(
             "LLM chat completion failed: duration_ms=%d error=%s",
@@ -168,6 +213,8 @@ def _call_chat_completion(
             e,
         )
         return "", f"LLM failed: {e}"
+    finally:
+        conn.close()
 
     content = _strip_model_artifacts(_extract_message_content(response_payload))
     if not content:
@@ -251,6 +298,7 @@ def summarize_markdown(
     url: str = "",
     title: str = "",
     prompt: str = "",
+    cancel: threading.Event | None = None,
 ) -> _SummaryResult:
     """Summarize Markdown through the configured OpenAI-compatible endpoint.
 
@@ -271,6 +319,7 @@ def summarize_markdown(
         user_prompt=_summary_user_prompt(llm_input, url=url, title=title, prompt=prompt),
         max_tokens_env="LLM_SUMMARY_MAX_TOKENS",
         default_max_tokens=_DEFAULT_SUMMARY_MAX_TOKENS,
+        cancel=cancel,
     )
     if error:
         log.warning(
